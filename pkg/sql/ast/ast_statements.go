@@ -29,10 +29,15 @@ type QueryExpression interface {
 // It supports the ALL modifier (e.g., UNION ALL) and proper left-associative parsing.
 // Phase 2 Complete: Full parser support with left-associative precedence.
 type SetOperation struct {
+	With     *WithClause // Lexical scope covering both branches.
 	Left     Statement
 	Operator string // UNION, EXCEPT, INTERSECT
 	Right    Statement
-	All      bool // UNION ALL vs UNION
+	All      bool                // UNION ALL vs UNION
+	OrderBy  []OrderByExpression // Result-scoped, not attached to the final branch.
+	Limit    *int
+	Offset   *int
+	Fetch    *FetchClause
 }
 
 func (s *SetOperation) statementNode()       {}
@@ -40,11 +45,17 @@ func (s *SetOperation) queryExpressionNode() {}
 func (s SetOperation) TokenLiteral() string  { return s.Operator }
 func (s SetOperation) Children() []Node {
 	var nodes []Node
+	if s.With != nil {
+		nodes = append(nodes, s.With)
+	}
 	if s.Left != nil {
 		nodes = append(nodes, s.Left)
 	}
 	if s.Right != nil {
 		nodes = append(nodes, s.Right)
+	}
+	for i := range s.OrderBy {
+		nodes = append(nodes, &s.OrderBy[i])
 	}
 	return nodes
 }
@@ -124,6 +135,7 @@ type SelectStatement struct {
 	Columns           []Expression
 	From              []TableReference
 	TableName         string // Added for pool operations
+	Into              string // SELECT INTO write target; not a source relation.
 	Joins             []JoinClause
 	ArrayJoin         *ArrayJoinClause // ClickHouse ARRAY JOIN / LEFT ARRAY JOIN clause
 	PrewhereClause    Expression       // ClickHouse PREWHERE clause (applied before WHERE, before reading data)
@@ -308,6 +320,7 @@ type CreateTableStatement struct {
 	IfNotExists  bool
 	Temporary    bool
 	Name         string
+	Query        QueryExpression // CREATE TABLE ... AS query, retained for lineage/extraction.
 	Columns      []ColumnDef
 	Constraints  []TableConstraint
 	Inherits     []string
@@ -329,6 +342,9 @@ func (c *CreateTableStatement) statementNode()      {}
 func (c CreateTableStatement) TokenLiteral() string { return "CREATE TABLE" }
 func (c CreateTableStatement) Children() []Node {
 	children := make([]Node, 0)
+	if c.Query != nil {
+		children = append(children, c.Query)
+	}
 	for _, col := range c.Columns {
 		col := col // G601: Create local copy to avoid memory aliasing
 		children = append(children, &col)

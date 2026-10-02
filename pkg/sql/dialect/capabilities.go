@@ -82,7 +82,15 @@ const (
 
 	// Redshift is Amazon Redshift
 	// (https://docs.aws.amazon.com/redshift/latest/dg/).
-	Redshift Dialect = "redshift"
+	Redshift   Dialect = "redshift"
+	DuckDB     Dialect = "duckdb"
+	Spark      Dialect = "spark"
+	Databricks Dialect = "databricks"
+	Trino      Dialect = "trino"
+	Athena     Dialect = "athena"
+	Doris      Dialect = "doris"
+	StarRocks  Dialect = "starrocks"
+	Fabric     Dialect = "fabric"
 
 	// Generic represents standard/ANSI SQL with no dialect-specific
 	// features. It is distinct from Unknown: Generic explicitly means
@@ -121,6 +129,22 @@ func Parse(s string) Dialect {
 		return BigQuery
 	case "redshift":
 		return Redshift
+	case "duckdb":
+		return DuckDB
+	case "spark":
+		return Spark
+	case "databricks":
+		return Databricks
+	case "trino":
+		return Trino
+	case "athena":
+		return Athena
+	case "doris":
+		return Doris
+	case "starrocks":
+		return StarRocks
+	case "fabric":
+		return Fabric
 	case "generic", "ansi", "standard":
 		return Generic
 	default:
@@ -136,7 +160,8 @@ func (d Dialect) String() string { return string(d) }
 func (d Dialect) IsValid() bool {
 	switch d {
 	case PostgreSQL, MySQL, MariaDB, SQLServer, Oracle, SQLite,
-		Snowflake, ClickHouse, BigQuery, Redshift, Generic:
+		Snowflake, ClickHouse, BigQuery, Redshift, Generic,
+		DuckDB, Spark, Databricks, Trino, Athena, Doris, StarRocks, Fabric:
 		return true
 	default:
 		return false
@@ -389,6 +414,22 @@ func (d Dialect) Capabilities() Capabilities {
 			SupportsILike:                 true,
 		}
 
+	case Fabric:
+		return SQLServer.Capabilities()
+	case Doris, StarRocks:
+		return MySQL.Capabilities()
+	case DuckDB:
+		c := PostgreSQL.Capabilities()
+		c.SupportsQualify, c.SupportsPivotUnpivot = true, true
+		return c
+	case Spark, Databricks:
+		return Capabilities{SupportsLimitOffset: true, SupportsBacktickQuoting: true,
+			SupportsQualify: d == Databricks, SupportsWindowIgnoreNulls: true,
+			SupportsPivotUnpivot: true, SupportsMerge: true}
+	case Trino, Athena:
+		return Capabilities{SupportsLimitOffset: true, SupportsFetchFirst: true,
+			SupportsDoubleQuoteIdentifier: true, SupportsWindowIgnoreNulls: true,
+			SupportsMatchRecognize: true}
 	case Generic:
 		// Standard / ANSI SQL: fetch-first, merge, returning are all
 		// in the standard; LIMIT is NOT.

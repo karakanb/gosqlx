@@ -365,9 +365,13 @@ func (f *FunctionCall) SQL() string {
 		sb.WriteString(")")
 	}
 	if f.Over != nil {
-		sb.WriteString(" OVER (")
-		sb.WriteString(windowSpecSQL(f.Over))
-		sb.WriteString(")")
+		if f.Over.Name != "" {
+			sb.WriteString(" OVER " + f.Over.Name)
+		} else {
+			sb.WriteString(" OVER (")
+			sb.WriteString(windowSpecSQL(f.Over))
+			sb.WriteString(")")
+		}
 	}
 	return sb.String()
 }
@@ -547,19 +551,22 @@ func (s *SelectStatement) SQL() string {
 
 	sb.WriteString(exprListSQL(s.Columns))
 
+	if s.Into != "" {
+		sb.WriteString(" INTO ")
+		sb.WriteString(s.Into)
+	}
 	if len(s.From) > 0 {
 		sb.WriteString(" FROM ")
 		froms := make([]string, len(s.From))
 		for i := range s.From {
 			froms[i] = tableRefSQL(&s.From[i])
+			for j := range s.Joins {
+				if s.Joins[j].FromIndex == i {
+					froms[i] += " " + joinSQL(&s.Joins[j])
+				}
+			}
 		}
 		sb.WriteString(strings.Join(froms, ", "))
-	}
-
-	for _, j := range s.Joins {
-		j := j // G601: Create local copy to avoid memory aliasing
-		sb.WriteString(" ")
-		sb.WriteString(joinSQL(&j))
 	}
 
 	if s.ArrayJoin != nil {
@@ -807,6 +814,10 @@ func (c *CreateTableStatement) SQL() string {
 		sb.WriteString("IF NOT EXISTS ")
 	}
 	sb.WriteString(c.Name)
+	if c.Query != nil {
+		sb.WriteString(" AS " + stmtSQL(c.Query))
+		return sb.String()
+	}
 	sb.WriteString(" (")
 
 	parts := make([]string, 0, len(c.Columns)+len(c.Constraints))
@@ -974,11 +985,39 @@ func (s *SetOperation) SQL() string {
 	}
 	left := stmtSQL(s.Left)
 	right := stmtSQL(s.Right)
+	if _, ok := s.Left.(*SetOperation); ok {
+		left = "(" + left + ")"
+	}
+	if _, ok := s.Right.(*SetOperation); ok {
+		right = "(" + right + ")"
+	}
+	if q, ok := s.Left.(*SelectStatement); ok && (q.With != nil || len(q.OrderBy) > 0 || q.Limit != nil || q.Offset != nil || q.Fetch != nil) {
+		left = "(" + left + ")"
+	}
+	if q, ok := s.Right.(*SelectStatement); ok && (q.With != nil || len(q.OrderBy) > 0 || q.Limit != nil || q.Offset != nil || q.Fetch != nil) {
+		right = "(" + right + ")"
+	}
 	op := s.Operator
 	if s.All {
 		op += " ALL"
 	}
-	return fmt.Sprintf("%s %s %s", left, op, right)
+	text := fmt.Sprintf("%s %s %s", left, op, right)
+	if s.With != nil {
+		text = s.With.SQL() + " " + text
+	}
+	if len(s.OrderBy) > 0 {
+		text += " ORDER BY " + orderBySQL(s.OrderBy)
+	}
+	if s.Limit != nil {
+		text += fmt.Sprintf(" LIMIT %d", *s.Limit)
+	}
+	if s.Offset != nil {
+		text += fmt.Sprintf(" OFFSET %d", *s.Offset)
+	}
+	if s.Fetch != nil {
+		text += fetchSQL(s.Fetch)
+	}
+	return text
 }
 
 // SQL returns the SQL representation of this VALUES clause as
@@ -1326,12 +1365,34 @@ func tableRefSQL(t *TableReference) string {
 		sb.WriteString("(")
 		sb.WriteString(t.Subquery.SQL())
 		sb.WriteString(")")
+	} else if t.Query != nil {
+		sb.WriteString("(" + stmtSQL(t.Query) + ")")
+	} else if t.TableFunc != nil {
+		sb.WriteString(t.TableFunc.SQL())
 	} else {
 		sb.WriteString(t.Name)
 	}
-	if t.Alias != "" {
+	if t.ModifierInputAlias != "" {
+		sb.WriteString(" " + t.ModifierInputAlias)
+	}
+	if t.TimeTravel != nil {
+		sb.WriteString(" " + t.TimeTravel.SQL())
+	}
+	if t.Pivot != nil {
+		sb.WriteString(" " + t.Pivot.SQL())
+	}
+	if t.Unpivot != nil {
+		sb.WriteString(" " + t.Unpivot.SQL())
+	}
+	if t.MatchRecognize != nil {
+		sb.WriteString(" " + t.MatchRecognize.SQL())
+	}
+	if t.Alias != "" && t.Alias != t.ModifierInputAlias {
 		sb.WriteString(" ")
 		sb.WriteString(t.Alias)
+	}
+	if len(t.Columns) > 0 {
+		sb.WriteString("(" + strings.Join(t.Columns, ", ") + ")")
 	}
 	if t.Final {
 		sb.WriteString(" FINAL")
@@ -1350,16 +1411,26 @@ func joinSQL(j *JoinClause) string {
 	sb.WriteString(" JOIN ")
 	sb.WriteString(tableRefSQL(&j.Right))
 	if j.Condition != nil {
-		sb.WriteString(" ON ")
-		sb.WriteString(exprSQL(j.Condition))
+		if j.Using {
+			sb.WriteString(" USING (")
+			if list, ok := j.Condition.(*ListExpression); ok {
+				sb.WriteString(exprListSQL(list.Values))
+			} else {
+				sb.WriteString(exprSQL(j.Condition))
+			}
+			sb.WriteString(")")
+		} else {
+			sb.WriteString(" ON ")
+			sb.WriteString(exprSQL(j.Condition))
+		}
 	}
 	return sb.String()
 }
 
 func windowSpecSQL(w *WindowSpec) string {
 	var parts []string
-	if w.Name != "" {
-		parts = append(parts, w.Name)
+	if w.BaseName != "" {
+		parts = append(parts, w.BaseName)
 	}
 	if len(w.PartitionBy) > 0 {
 		parts = append(parts, "PARTITION BY "+exprListSQL(w.PartitionBy))

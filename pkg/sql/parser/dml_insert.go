@@ -102,10 +102,9 @@ func (p *Parser) parseInsertStatement() (ast.Statement, error) {
 	}
 
 	switch {
-	case p.isType(models.TokenTypeSelect):
+	case p.isType(models.TokenTypeSelect) || p.isType(models.TokenTypeWith):
 		// INSERT ... SELECT syntax
-		p.advance() // Consume SELECT
-		stmt, err := p.parseSelectWithSetOperations()
+		stmt, err := p.parseStatement()
 		if err != nil {
 			return nil, err
 		}

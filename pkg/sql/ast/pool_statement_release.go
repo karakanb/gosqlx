@@ -337,6 +337,7 @@ func PutSelectStatement(stmt *SelectStatement) {
 		PutExpression(stmt.Joins[i].Condition)
 		stmt.Joins[i].Condition = nil
 		stmt.Joins[i].Type = ""
+		stmt.Joins[i].FromIndex = 0
 	}
 	stmt.Joins = stmt.Joins[:0]
 
@@ -404,6 +405,7 @@ func PutSelectStatement(stmt *SelectStatement) {
 			w.FrameClause = nil
 		}
 		w.Name = ""
+		w.BaseName = ""
 	}
 	stmt.Windows = stmt.Windows[:0]
 
@@ -424,6 +426,7 @@ func PutSelectStatement(stmt *SelectStatement) {
 
 	// ── Scalars ────────────────────────────────────────────────────────
 	stmt.TableName = ""
+	stmt.Into = ""
 	stmt.Distinct = false
 
 	// Return to pool
@@ -443,6 +446,11 @@ func releaseTableReference(tr *TableReference) {
 		PutSelectStatement(tr.Subquery)
 		tr.Subquery = nil
 	}
+	if tr.Query != nil {
+		releaseStatement(tr.Query)
+		tr.Query = nil
+	}
+	tr.Columns = nil
 	// TableFunc is a *FunctionCall — release as expression.
 	if tr.TableFunc != nil {
 		PutExpression(tr.TableFunc)
@@ -451,6 +459,11 @@ func releaseTableReference(tr *TableReference) {
 	// Pivot.AggregateFunction is an Expression.
 	if tr.Pivot != nil {
 		PutExpression(tr.Pivot.AggregateFunction)
+		PutExpression(tr.Pivot.DefaultOnNull)
+		releaseStatement(tr.Pivot.ValueQuery)
+		for _, order := range tr.Pivot.OrderBy {
+			PutExpression(order.Expression)
+		}
 		tr.Pivot.AggregateFunction = nil
 		tr.Pivot = nil
 	}
@@ -499,7 +512,9 @@ func releaseTableReference(tr *TableReference) {
 		tr.ForSystemTime = nil
 	}
 	tr.Name = ""
+	tr.NameQuoted = false
 	tr.Alias = ""
+	tr.ModifierInputAlias = ""
 	tr.Lateral = false
 	tr.Final = false
 	tr.TableHints = nil
@@ -525,6 +540,8 @@ func PutCreateTableStatement(stmt *CreateTableStatement) {
 	if stmt == nil {
 		return
 	}
+	releaseStatement(stmt.Query)
+	stmt.Query = nil
 
 	// Release expressions embedded in column definitions
 	for i := range stmt.Columns {

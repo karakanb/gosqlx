@@ -432,18 +432,9 @@ func (qtc *qualifiedTableCollector) collectFromNode(node ast.Node) {
 				qtc.addTable(join.Right.Name)
 			}
 		}
-		if n.With != nil {
-			qtc.collectFromNode(n.With)
-		}
 	case *ast.InsertStatement:
 		if n.TableName != "" {
 			qtc.addTable(n.TableName)
-		}
-		if n.Query != nil {
-			qtc.collectFromNode(n.Query)
-		}
-		if n.With != nil {
-			qtc.collectFromNode(n.With)
 		}
 	case *ast.UpdateStatement:
 		if n.TableName != "" {
@@ -454,9 +445,6 @@ func (qtc *qualifiedTableCollector) collectFromNode(node ast.Node) {
 				qtc.addTable(from.Name)
 			}
 		}
-		if n.With != nil {
-			qtc.collectFromNode(n.With)
-		}
 	case *ast.DeleteStatement:
 		if n.TableName != "" {
 			qtc.addTable(n.TableName)
@@ -466,21 +454,9 @@ func (qtc *qualifiedTableCollector) collectFromNode(node ast.Node) {
 				qtc.addTable(using.Name)
 			}
 		}
-		if n.With != nil {
-			qtc.collectFromNode(n.With)
-		}
-	case *ast.WithClause:
-		for _, cte := range n.CTEs {
-			qtc.collectFromNode(cte)
-		}
-	case *ast.CommonTableExpr:
-		qtc.collectFromNode(n.Statement)
-	case *ast.SetOperation:
-		qtc.collectFromNode(n.Left)
-		qtc.collectFromNode(n.Right)
 	}
 
-	// Recursively collect from children
+	// Each structural edge is visited once, including WITH and set branches.
 	for _, child := range node.Children() {
 		qtc.collectFromNode(child)
 	}
@@ -703,18 +679,9 @@ func (qcc *qualifiedColumnCollector) collectFromNode(node ast.Node) {
 				qcc.collectFromExpression(ob.Expression)
 			}
 		}
-		if n.With != nil {
-			qcc.collectFromNode(n.With)
-		}
 	case *ast.InsertStatement:
 		for _, col := range n.Columns {
 			qcc.collectFromExpression(col)
-		}
-		if n.Query != nil {
-			qcc.collectFromNode(n.Query)
-		}
-		if n.With != nil {
-			qcc.collectFromNode(n.With)
 		}
 	case *ast.UpdateStatement:
 		for _, assignment := range n.Assignments {
@@ -724,31 +691,16 @@ func (qcc *qualifiedColumnCollector) collectFromNode(node ast.Node) {
 		if n.Where != nil {
 			qcc.collectFromExpression(n.Where)
 		}
-		if n.With != nil {
-			qcc.collectFromNode(n.With)
-		}
 	case *ast.DeleteStatement:
 		if n.Where != nil {
 			qcc.collectFromExpression(n.Where)
 		}
-		if n.With != nil {
-			qcc.collectFromNode(n.With)
-		}
 	case *ast.UpdateExpression:
 		qcc.collectFromExpression(n.Column)
 		qcc.collectFromExpression(n.Value)
-	case *ast.WithClause:
-		for _, cte := range n.CTEs {
-			qcc.collectFromNode(cte)
-		}
-	case *ast.CommonTableExpr:
-		qcc.collectFromNode(n.Statement)
-	case *ast.SetOperation:
-		qcc.collectFromNode(n.Left)
-		qcc.collectFromNode(n.Right)
 	}
 
-	// Recursively collect from children
+	// Each structural edge is visited once, including WITH and set branches.
 	for _, child := range node.Children() {
 		qcc.collectFromNode(child)
 	}

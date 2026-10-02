@@ -31,6 +31,9 @@ import (
 // tokens, Word.QuoteStyle). Embedded delimiters are escaped per dialect:
 // SQL Server doubles `]`, ANSI doubles `"`, MySQL doubles “ ` “.
 func renderQuotedIdent(tok models.Token) string {
+	if tok.Type == models.TokenTypeSingleQuotedString || tok.Type == models.TokenTypeString {
+		return "'" + strings.ReplaceAll(tok.Value, "'", "''") + "'"
+	}
 	q := tok.Quote
 	if q == 0 && tok.Word != nil {
 		q = tok.Word.QuoteStyle
@@ -131,6 +134,13 @@ func (p *Parser) parsePivotClause() (*ast.PivotClause, error) {
 	if err != nil {
 		return nil, err
 	}
+	if p.matchType(models.TokenTypeAs) || (!p.isType(models.TokenTypeFor) && p.isIdentifier()) {
+		if !p.isIdentifier() && !p.isNonReservedKeyword() {
+			return nil, p.expectedError("aggregate alias")
+		}
+		aggFunc = &ast.AliasedExpression{Expr: aggFunc, Alias: p.currentToken.Token.Value}
+		p.advance()
+	}
 
 	// Expect FOR keyword
 	if !p.isType(models.TokenTypeFor) {
@@ -160,27 +170,46 @@ func (p *Parser) parsePivotClause() (*ast.PivotClause, error) {
 	// Parse IN values — identifiers, numbers, or string literals, each with
 	// an optional AS alias (Oracle syntax: 'North' AS north).
 	var inValues []string
-	for !p.isType(models.TokenTypeRParen) && !p.isType(models.TokenTypeEOF) {
+	var values []ast.PivotValue
+	dynamic := p.matchType(models.TokenTypeAny)
+	var order []ast.OrderByExpression
+	var valueQuery ast.Statement
+	if dynamic {
+		order, err = p.parseOrderByClause()
+		if err != nil {
+			return nil, err
+		}
+	} else if p.isAnyType(models.TokenTypeSelect, models.TokenTypeWith) {
+		valueQuery, err = p.parseSubquery()
+		if err != nil {
+			return nil, err
+		}
+	}
+	for !dynamic && valueQuery == nil && !p.isType(models.TokenTypeRParen) && !p.isType(models.TokenTypeEOF) {
 		if !p.isIdentifier() && !p.isType(models.TokenTypeNumber) && !p.isStringLiteral() {
 			return nil, p.expectedError("value in PIVOT IN list")
 		}
 		val := renderQuotedIdent(p.currentToken.Token)
+		entry := ast.PivotValue{Name: val}
 		p.advance()
 		// Optional alias: AS <name>
-		if p.isType(models.TokenTypeAs) {
-			p.advance() // consume AS
-			if p.isIdentifier() || p.isNonReservedKeyword() {
-				val += " AS " + p.currentToken.Token.Value
+		if p.matchType(models.TokenTypeAs) || p.isIdentifier() {
+			if p.isIdentifier() || p.isNonReservedKeyword() || p.isAnyType(models.TokenTypeFirst, models.TokenTypeLast) {
+				entry.Alias = p.currentToken.Token.Value
+				val += " AS " + renderQuotedIdent(p.currentToken.Token)
 				p.advance()
+			} else {
+				return nil, p.expectedError("pivot value alias")
 			}
 		}
+		values = append(values, entry)
 		inValues = append(inValues, val)
 		if p.isType(models.TokenTypeComma) {
 			p.advance()
 		}
 	}
 
-	if len(inValues) == 0 {
+	if len(inValues) == 0 && !dynamic && valueQuery == nil {
 		return nil, p.expectedError("at least one value in PIVOT IN list")
 	}
 	if !p.isType(models.TokenTypeRParen) {
@@ -188,6 +217,19 @@ func (p *Parser) parsePivotClause() (*ast.PivotClause, error) {
 	}
 	p.advance() // close IN list )
 
+	var defaultValue ast.Expression
+	if p.matchType(models.TokenTypeDefault) {
+		if !p.matchType(models.TokenTypeOn) || !p.matchType(models.TokenTypeNull) || !p.matchType(models.TokenTypeLParen) {
+			return nil, p.expectedError("ON NULL ( after DEFAULT")
+		}
+		defaultValue, err = p.parseExpression()
+		if err != nil {
+			return nil, err
+		}
+		if !p.matchType(models.TokenTypeRParen) {
+			return nil, p.expectedError(") after PIVOT default")
+		}
+	}
 	if !p.isType(models.TokenTypeRParen) {
 		return nil, p.expectedError(") to close PIVOT clause")
 	}
@@ -197,6 +239,11 @@ func (p *Parser) parsePivotClause() (*ast.PivotClause, error) {
 		AggregateFunction: aggFunc,
 		PivotColumn:       pivotCol,
 		InValues:          inValues,
+		Values:            values,
+		Dynamic:           dynamic,
+		OrderBy:           order,
+		ValueQuery:        valueQuery,
+		DefaultOnNull:     defaultValue,
 		Pos:               pos,
 	}, nil
 }
@@ -206,6 +253,15 @@ func (p *Parser) parsePivotClause() (*ast.PivotClause, error) {
 func (p *Parser) parseUnpivotClause() (*ast.UnpivotClause, error) {
 	pos := p.currentLocation()
 	p.advance() // consume UNPIVOT
+	includeNulls := false
+	if p.isTokenMatch("INCLUDE") || p.isTokenMatch("EXCLUDE") {
+		includeNulls = p.isTokenMatch("INCLUDE")
+		p.advance()
+		if !p.isTokenMatch("NULLS") {
+			return nil, p.expectedError("NULLS")
+		}
+		p.advance()
+	}
 
 	if !p.isType(models.TokenTypeLParen) {
 		return nil, p.expectedError("( after UNPIVOT")
@@ -247,20 +303,26 @@ func (p *Parser) parseUnpivotClause() (*ast.UnpivotClause, error) {
 	// Parse IN columns — each may have an optional AS alias (Oracle:
 	// north_sales AS 'North').
 	var cols []string
+	var columns []ast.PivotValue
 	for !p.isType(models.TokenTypeRParen) && !p.isType(models.TokenTypeEOF) {
 		if !p.isIdentifier() {
 			return nil, p.expectedError("column name in UNPIVOT IN list")
 		}
 		col := renderQuotedIdent(p.currentToken.Token)
+		entry := ast.PivotValue{Name: col}
 		p.advance()
 		// Optional alias: AS <string_literal_or_identifier>
 		if p.isType(models.TokenTypeAs) {
 			p.advance() // consume AS
 			if p.isStringLiteral() || p.isIdentifier() || p.isNonReservedKeyword() {
+				entry.Alias = renderQuotedIdent(p.currentToken.Token)
 				col += " AS " + renderQuotedIdent(p.currentToken.Token)
 				p.advance()
+			} else {
+				return nil, p.expectedError("unpivot value alias")
 			}
 		}
+		columns = append(columns, entry)
 		cols = append(cols, col)
 		if p.isType(models.TokenTypeComma) {
 			p.advance()
@@ -281,10 +343,12 @@ func (p *Parser) parseUnpivotClause() (*ast.UnpivotClause, error) {
 	p.advance() // close UNPIVOT )
 
 	return &ast.UnpivotClause{
-		ValueColumn: valueCol,
-		NameColumn:  nameCol,
-		InColumns:   cols,
-		Pos:         pos,
+		ValueColumn:  valueCol,
+		NameColumn:   nameCol,
+		InColumns:    cols,
+		Columns:      columns,
+		IncludeNulls: includeNulls,
+		Pos:          pos,
 	}, nil
 }
 
@@ -296,7 +360,8 @@ func (p *Parser) supportsTableFunction() bool {
 	switch p.dialect {
 	case string(keywords.DialectSnowflake),
 		string(keywords.DialectBigQuery),
-		string(keywords.DialectPostgreSQL):
+		string(keywords.DialectPostgreSQL),
+		"duckdb", "spark", "databricks", "trino", "athena":
 		return true
 	}
 	return false
@@ -312,7 +377,7 @@ func (p *Parser) parseSnowflakeTimeTravel() (*ast.TimeTravelClause, error) {
 		return nil, err
 	}
 	// Allow additional clauses: CHANGES (...) AT (...) is legal.
-	for p.isSnowflakeTimeTravelStart() {
+	for p.isSnowflakeTimeTravelStart() || (head.Kind == "CHANGES" && p.isTokenMatch("END") && p.peekToken().Token.Type == models.TokenTypeLParen) {
 		next, err := p.parseOneTimeTravelClause()
 		if err != nil {
 			return nil, err

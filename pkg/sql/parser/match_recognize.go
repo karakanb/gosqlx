@@ -183,11 +183,17 @@ func (p *Parser) parseMatchRecognize() (*ast.MatchRecognizeClause, error) {
 					patParts = append(patParts, ")")
 				}
 			} else {
+				if (p.isIdentifier() || p.isNonReservedKeyword()) && !p.isTokenMatch("PERMUTE") {
+					clause.PatternVariables = append(clause.PatternVariables, p.currentToken.Token.Value)
+				}
 				patParts = append(patParts, p.currentToken.Token.Value)
 			}
 			p.advance()
 		}
 		clause.Pattern = strings.Join(patParts, " ")
+	}
+	if clause.Pattern == "" {
+		return nil, p.expectedError("PATTERN in MATCH_RECOGNIZE")
 	}
 
 	// DEFINE var AS condition, ...

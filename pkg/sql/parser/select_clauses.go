@@ -97,8 +97,20 @@ func (p *Parser) parseFromClause() (tableName string, tables []ast.TableReferenc
 
 	tables = []ast.TableReference{firstRef}
 
-	// Additional comma-separated table references (implicit cross joins)
-	for p.isType(models.TokenTypeComma) {
+	// Explicit JOIN binds more tightly than comma. Each comma item owns its
+	// chain; retaining this index also preserves rendering and ON visibility.
+	for {
+		chain, e := p.parseJoinClauses(tables[len(tables)-1])
+		if e != nil {
+			return "", nil, nil, e
+		}
+		for i := range chain {
+			chain[i].FromIndex = len(tables) - 1
+		}
+		joins = append(joins, chain...)
+		if !p.isType(models.TokenTypeComma) {
+			break
+		}
 		p.advance()
 		ref, e2 := p.parseFromTableReference()
 		if e2 != nil {
@@ -107,17 +119,26 @@ func (p *Parser) parseFromClause() (tableName string, tables []ast.TableReferenc
 		tables = append(tables, ref)
 	}
 
-	// JOIN clauses
-	joins, err = p.parseJoinClauses(firstRef)
-	return tableName, tables, joins, err
+	return tableName, tables, joins, nil
 }
 
 // parseJoinClauses parses zero or more JOIN clauses that follow the FROM table list.
 // firstRef is the primary (left-most) table, used for building JoinClause.Left.
 func (p *Parser) parseJoinClauses(firstRef ast.TableReference) ([]ast.JoinClause, error) {
 	joins := []ast.JoinClause{}
+	// FROM owns the subquery/function/modifier nodes. JOIN.Left records only
+	// identity; copying the owned pointers visits and releases them twice.
+	leftIdentity := ast.TableReference{Name: firstRef.Name, Alias: firstRef.Alias, NameQuoted: firstRef.NameQuoted}
 
-	for p.isJoinKeyword() {
+	for p.isJoinKeyword() || ((p.dialect == "spark" || p.dialect == "databricks") && p.isType(models.TokenTypeLateral)) {
+		if p.isType(models.TokenTypeLateral) {
+			ref, err := p.parseLateralView()
+			if err != nil {
+				return nil, err
+			}
+			joins = append(joins, ast.JoinClause{Type: "CROSS", Left: leftIdentity, Right: ref})
+			continue
+		}
 		joinPos := p.currentLocation()
 		joinType, isNatural, err := p.parseJoinType()
 		if err != nil {
@@ -143,6 +164,7 @@ func (p *Parser) parseJoinClauses(firstRef ast.TableReference) ([]ast.JoinClause
 			return nil, err
 		}
 
+		using := p.isType(models.TokenTypeUsing)
 		joinCondition, err := p.parseJoinCondition(joinType, isNatural, isApply)
 		if err != nil {
 			return nil, err
@@ -151,7 +173,7 @@ func (p *Parser) parseJoinClauses(firstRef ast.TableReference) ([]ast.JoinClause
 		// Build left-side reference (synthetic for chained joins)
 		var leftTable ast.TableReference
 		if len(joins) == 0 {
-			leftTable = firstRef
+			leftTable = leftIdentity
 		} else {
 			leftTable = ast.TableReference{
 				Name: fmt.Sprintf("(%s_with_%d_joins)", firstRef.Name, len(joins)),
@@ -163,6 +185,7 @@ func (p *Parser) parseJoinClauses(firstRef ast.TableReference) ([]ast.JoinClause
 			Left:      leftTable,
 			Right:     joinedTableRef,
 			Condition: joinCondition,
+			Using:     using,
 			Pos:       joinPos,
 		})
 	}
@@ -242,6 +265,10 @@ func (p *Parser) parseJoinType() (string, bool, error) {
 		}
 	}
 
+	if strings.EqualFold(p.currentToken.Token.Value, "SEMI") || strings.EqualFold(p.currentToken.Token.Value, "ANTI") {
+		joinType += " " + strings.ToUpper(p.currentToken.Token.Value)
+		p.advance()
+	}
 	if isNatural {
 		// NATURAL JOIN without an explicit type keyword → just "NATURAL" (SQL standard).
 		// NATURAL with an explicit keyword → "NATURAL LEFT", "NATURAL INNER", etc.
@@ -306,6 +333,15 @@ func (p *Parser) parseJoinCondition(joinType string, isNatural, isApply bool) (a
 		return &ast.ListExpression{Values: usingColumns}, nil
 	}
 
+	// MySQL/SQLite (and the permissive generic grammar) allow an inner
+	// join without a predicate, with cross-product semantics. Outer joins
+	// still require a condition. Do not accept this extension in PostgreSQL.
+	if joinType == "INNER" {
+		switch p.dialect {
+		case "", string(keywords.DialectGeneric), string(keywords.DialectMySQL), string(keywords.DialectMariaDB), string(keywords.DialectSQLite):
+			return nil, nil
+		}
+	}
 	return nil, p.expectedError("ON or USING")
 }
 

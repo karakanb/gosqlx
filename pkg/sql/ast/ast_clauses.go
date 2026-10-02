@@ -43,6 +43,7 @@ func (w WithClause) Children() []Node {
 // Phase 2.6: Added MATERIALIZED/NOT MATERIALIZED support for query optimization hints.
 type CommonTableExpr struct {
 	Name         string
+	NameQuoted   bool // Quoting matters when binding a CTE in a case-folding dialect.
 	Columns      []string
 	Statement    Statement
 	ScalarExpr   Expression      // ClickHouse: WITH <expr> AS <name> (scalar CTE, no subquery)
@@ -66,9 +67,11 @@ func (c CommonTableExpr) Children() []Node {
 // JoinClause represents a JOIN clause in SQL
 type JoinClause struct {
 	Type      string // INNER, LEFT, RIGHT, FULL
+	FromIndex int    // Index of the comma-separated FROM item owning this JOIN chain.
 	Left      TableReference
 	Right     TableReference
 	Condition Expression
+	Using     bool            // Condition is a USING column/list, rather than an ON expression.
 	Pos       models.Location // Source position of the JOIN keyword (1-based line and column)
 }
 
@@ -123,12 +126,16 @@ func (j JoinClause) Children() []Node {
 //
 // New in v1.6.0: Lateral field for PostgreSQL LATERAL JOIN support.
 type TableReference struct {
-	Name       string           // Table name (empty if this is a derived table)
-	Alias      string           // Optional alias
-	Subquery   *SelectStatement // For derived tables: (SELECT ...) AS alias
-	Lateral    bool             // LATERAL keyword for correlated subqueries (PostgreSQL)
-	TableHints []string         // SQL Server table hints: WITH (NOLOCK), WITH (ROWLOCK, UPDLOCK), etc.
-	Final      bool             // ClickHouse FINAL modifier: forces MergeTree part merge
+	Name               string           // Table name (empty if this is a derived table)
+	NameQuoted         bool             // First name component was delimited in the input.
+	Alias              string           // Optional alias
+	ModifierInputAlias string           // Alias before PIVOT/UNPIVOT/MATCH_RECOGNIZE, if any.
+	Subquery           *SelectStatement // For derived tables: (SELECT ...) AS alias
+	Query              QueryExpression  // Non-SELECT derived queries, such as UNION.
+	Columns            []string         // Positional table/derived/function column aliases.
+	Lateral            bool             // LATERAL keyword for correlated subqueries (PostgreSQL)
+	TableHints         []string         // SQL Server table hints: WITH (NOLOCK), WITH (ROWLOCK, UPDLOCK), etc.
+	Final              bool             // ClickHouse FINAL modifier: forces MergeTree part merge
 	// TableFunc is a function-call table reference such as
 	// Snowflake LATERAL FLATTEN(input => col), TABLE(my_func(1,2)),
 	// IDENTIFIER('t'), or PostgreSQL unnest(array_col). When set, Name
@@ -165,6 +172,9 @@ func (t TableReference) Children() []Node {
 	var nodes []Node
 	if t.Subquery != nil {
 		nodes = append(nodes, t.Subquery)
+	}
+	if t.Query != nil {
+		nodes = append(nodes, t.Query)
 	}
 	if t.TableFunc != nil {
 		nodes = append(nodes, t.TableFunc)
@@ -203,6 +213,7 @@ func (o *OrderByExpression) Children() []Node {
 // WindowSpec represents a window specification
 type WindowSpec struct {
 	Name        string
+	BaseName    string // Inherited window in OVER (base ...) or WINDOW w AS (base ...).
 	PartitionBy []Expression
 	OrderBy     []OrderByExpression
 	FrameClause *WindowFrame
@@ -606,19 +617,41 @@ func (c TimeTravelClause) Children() []Node {
 //
 //	PIVOT (SUM(sales) FOR region IN ([North], [South], [East], [West])) AS pvt
 type PivotClause struct {
-	AggregateFunction Expression      // The aggregate function, e.g. SUM(sales)
-	PivotColumn       string          // The column used for pivoting, e.g. region
-	InValues          []string        // The values to pivot on, e.g. [North], [South]
-	Pos               models.Location // Source position of the PIVOT keyword
+	AggregateFunction Expression          // The aggregate function, e.g. SUM(sales)
+	PivotColumn       string              // The column used for pivoting, e.g. region
+	InValues          []string            // The values to pivot on, e.g. [North], [South]
+	Values            []PivotValue        // Structured value/alias pairs, in output order.
+	Dynamic           bool                // ANY: output names require data, not just schema.
+	OrderBy           []OrderByExpression // Ordering for dynamic values.
+	ValueQuery        Statement           // Subquery providing dynamic pivot values.
+	DefaultOnNull     Expression          // Scalar replacement for NULL aggregate results.
+	Pos               models.Location     // Source position of the PIVOT keyword
+}
+
+// PivotValue separates a rendered literal/identifier from its optional alias.
+// The legacy InValues/InColumns strings remain available for rendering.
+type PivotValue struct {
+	Name  string
+	Alias string
 }
 
 func (p *PivotClause) expressionNode()     {}
 func (p PivotClause) TokenLiteral() string { return "PIVOT" }
 func (p PivotClause) Children() []Node {
+	var nodes []Node
 	if p.AggregateFunction != nil {
-		return []Node{p.AggregateFunction}
+		nodes = append(nodes, p.AggregateFunction)
 	}
-	return nil
+	if p.DefaultOnNull != nil {
+		nodes = append(nodes, p.DefaultOnNull)
+	}
+	if p.ValueQuery != nil {
+		nodes = append(nodes, p.ValueQuery)
+	}
+	for i := range p.OrderBy {
+		nodes = append(nodes, &p.OrderBy[i])
+	}
+	return nodes
 }
 
 // UnpivotClause represents the SQL Server / Oracle UNPIVOT operator for column-to-row
@@ -626,10 +659,12 @@ func (p PivotClause) Children() []Node {
 //
 //	UNPIVOT (sales FOR region IN (north_sales, south_sales, east_sales)) AS unpvt
 type UnpivotClause struct {
-	ValueColumn string          // The target value column, e.g. sales
-	NameColumn  string          // The target name column, e.g. region
-	InColumns   []string        // The source columns to unpivot, e.g. north_sales, south_sales
-	Pos         models.Location // Source position of the UNPIVOT keyword
+	ValueColumn  string          // The target value column, e.g. sales
+	NameColumn   string          // The target name column, e.g. region
+	InColumns    []string        // The source columns to unpivot, e.g. north_sales, south_sales
+	Columns      []PivotValue    // Source names separate from optional value labels.
+	IncludeNulls bool            // Default is EXCLUDE NULLS.
+	Pos          models.Location // Source position of the UNPIVOT keyword
 }
 
 func (u *UnpivotClause) expressionNode()     {}
@@ -659,14 +694,15 @@ type PeriodDefinition struct {
 //	  DEFINE UP AS price > PREV(price), DOWN AS price < PREV(price)
 //	)
 type MatchRecognizeClause struct {
-	PartitionBy  []Expression
-	OrderBy      []OrderByExpression
-	Measures     []MeasureDef
-	RowsPerMatch string // "ONE ROW PER MATCH" or "ALL ROWS PER MATCH" (empty = default)
-	AfterMatch   string // raw text: "SKIP TO NEXT ROW", "SKIP PAST LAST ROW", etc.
-	Pattern      string // raw pattern text: "UP+ DOWN+"
-	Definitions  []PatternDef
-	Pos          models.Location
+	PartitionBy      []Expression
+	OrderBy          []OrderByExpression
+	Measures         []MeasureDef
+	RowsPerMatch     string   // "ONE ROW PER MATCH" or "ALL ROWS PER MATCH" (empty = default)
+	AfterMatch       string   // raw text: "SKIP TO NEXT ROW", "SKIP PAST LAST ROW", etc.
+	Pattern          string   // raw pattern text: "UP+ DOWN+"
+	PatternVariables []string // Names in PATTERN, including implicitly true variables.
+	Definitions      []PatternDef
+	Pos              models.Location
 }
 
 // MeasureDef is one MEASURES entry: expr AS alias.

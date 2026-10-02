@@ -80,13 +80,12 @@ func (p *Parser) parseCreateView(orReplace, temporary bool) (*ast.CreateViewStat
 	}
 	p.advance() // Consume AS
 
-	// Parse the SELECT statement
-	if !p.isType(models.TokenTypeSelect) {
+	// A view query can begin with WITH as well as SELECT.
+	if !p.isType(models.TokenTypeSelect) && !p.isType(models.TokenTypeWith) {
 		return nil, p.expectedError("SELECT")
 	}
-	p.advance() // Consume SELECT
 
-	query, err := p.parseSelectWithSetOperations()
+	query, err := p.parseStatement()
 	if err != nil {
 		return nil, goerrors.WrapError(
 			goerrors.ErrCodeInvalidSyntax,

@@ -561,6 +561,22 @@ func releaseStatement(stmt Statement) {
 		return
 	}
 	switch s := stmt.(type) {
+	case *SetOperation:
+		if s.With != nil {
+			for _, cte := range s.With.CTEs {
+				if cte != nil {
+					releaseStatement(cte.Statement)
+					PutExpression(cte.ScalarExpr)
+				}
+			}
+			s.With = nil
+		}
+		releaseStatement(s.Left)
+		releaseStatement(s.Right)
+		for _, order := range s.OrderBy {
+			PutExpression(order.Expression)
+		}
+		s.Left, s.Right, s.OrderBy = nil, nil, nil
 	case *SelectStatement:
 		PutSelectStatement(s)
 	case *InsertStatement:

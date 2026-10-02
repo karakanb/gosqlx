@@ -77,6 +77,13 @@ func (p *Parser) parseSelectStatement() (ast.Statement, error) {
 	if err != nil {
 		return nil, err
 	}
+	var into string
+	if p.matchType(models.TokenTypeInto) {
+		into, err = p.parseQualifiedName()
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	// FROM … JOIN clauses
 	tableName, tables, joins, err := p.parseFromClause()
@@ -93,6 +100,7 @@ func (p *Parser) parseSelectStatement() (ast.Statement, error) {
 		From:              tables,
 		Joins:             joins,
 		TableName:         tableName,
+		Into:              into,
 	}
 
 	// ClickHouse ARRAY JOIN / LEFT ARRAY JOIN.
@@ -400,7 +408,7 @@ func (p *Parser) parseSelectColumnList() ([]ast.Expression, error) {
 			// Optional alias: AS name  or  implicit name (non-identifier expressions only)
 			if p.isType(models.TokenTypeAs) {
 				p.advance() // Consume AS
-				if !p.isIdentifier() {
+				if !p.canBeAlias() {
 					return nil, p.expectedError("alias name after AS")
 				}
 				alias := p.currentToken.Token.Value
@@ -421,12 +429,25 @@ func (p *Parser) parseSelectColumnList() ([]ast.Expression, error) {
 			}
 		}
 
+		if id, ok := expr.(*ast.Identifier); ok && id.Name == "*" {
+			var err error
+			expr, err = p.parseStarModifiers(id)
+			if err != nil {
+				return nil, err
+			}
+		}
 		columns = append(columns, expr)
 
 		if !p.isType(models.TokenTypeComma) {
 			break
 		}
 		p.advance() // Consume comma
+		if p.isType(models.TokenTypeFrom) {
+			switch p.dialect {
+			case "bigquery", "snowflake", "duckdb", "clickhouse":
+				return columns, nil
+			}
+		}
 	}
 	return columns, nil
 }

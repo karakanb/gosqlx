@@ -252,14 +252,13 @@ func renderSelect(s *ast.SelectStatement, opts ast.FormatOptions) string {
 		froms := make([]string, len(s.From))
 		for i := range s.From {
 			froms[i] = tableRefSQL(&s.From[i], f)
+			for j := range s.Joins {
+				if s.Joins[j].FromIndex == i {
+					froms[i] += f.clauseSep() + joinSQL(&s.Joins[j], f)
+				}
+			}
 		}
 		sb.WriteString(strings.Join(froms, ", "))
-	}
-
-	for _, j := range s.Joins {
-		j := j
-		sb.WriteString(f.clauseSep())
-		sb.WriteString(joinSQL(&j, f))
 	}
 
 	if s.Sample != nil {
@@ -636,8 +635,28 @@ func renderSetOperation(s *ast.SetOperation, opts ast.FormatOptions) string {
 	f := newNodeFormatter(opts)
 	sb := f.sb
 
+	if s.With != nil {
+		sb.WriteString(renderWith(s.With, f))
+		sb.WriteString(f.clauseSep())
+	}
+	branch := func(stmt ast.Statement) string {
+		childOpts := opts
+		childOpts.AddSemicolon = false
+		text := FormatStatement(stmt, childOpts)
+		group := false
+		switch q := stmt.(type) {
+		case *ast.SetOperation:
+			group = true
+		case *ast.SelectStatement:
+			group = q.With != nil || len(q.OrderBy) > 0 || q.Limit != nil || q.Offset != nil || q.Fetch != nil
+		}
+		if group {
+			return "(" + text + ")"
+		}
+		return text
+	}
 	if s.Left != nil {
-		sb.WriteString(FormatStatement(s.Left, opts))
+		sb.WriteString(branch(s.Left))
 	}
 	sb.WriteString(f.clauseSep())
 	op := s.Operator
@@ -647,7 +666,19 @@ func renderSetOperation(s *ast.SetOperation, opts ast.FormatOptions) string {
 	sb.WriteString(f.kw(op))
 	sb.WriteString(f.clauseSep())
 	if s.Right != nil {
-		sb.WriteString(FormatStatement(s.Right, opts))
+		sb.WriteString(branch(s.Right))
+	}
+	if len(s.OrderBy) > 0 {
+		sb.WriteString(f.clauseSep() + f.kw("ORDER BY") + " " + orderBySQL(s.OrderBy))
+	}
+	if s.Limit != nil {
+		fmt.Fprintf(sb, "%s%s %d", f.clauseSep(), f.kw("LIMIT"), *s.Limit)
+	}
+	if s.Offset != nil {
+		fmt.Fprintf(sb, "%s%s %d", f.clauseSep(), f.kw("OFFSET"), *s.Offset)
+	}
+	if s.Fetch != nil {
+		sb.WriteString(fetchSQL(s.Fetch, f))
 	}
 
 	if opts.AddSemicolon {
@@ -1187,7 +1218,9 @@ func renderWith(w *ast.WithClause, f *nodeFormatter) string {
 			s += "(" + strings.Join(cte.Columns, ", ") + ") "
 		}
 		s += f.kw("AS") + " ("
-		s += FormatStatement(cte.Statement, f.opts)
+		childOpts := f.opts
+		childOpts.AddSemicolon = false
+		s += FormatStatement(cte.Statement, childOpts)
 		s += ")"
 		ctes[i] = s
 	}
@@ -1258,10 +1291,19 @@ func tableRefSQL(t *ast.TableReference, f *nodeFormatter) string {
 		sb.WriteString("(")
 		sb.WriteString(stmtSQL(t.Subquery))
 		sb.WriteString(")")
+	} else if t.Query != nil {
+		sb.WriteString("(" + stmtSQL(t.Query) + ")")
+	} else if t.TableFunc != nil {
+		sb.WriteString(exprSQL(t.TableFunc))
 	} else {
 		sb.WriteString(t.Name)
 	}
-	if t.Pivot != nil {
+	if t.ModifierInputAlias != "" {
+		sb.WriteString(" " + t.ModifierInputAlias)
+	}
+	if t.Pivot != nil && (t.Pivot.Dynamic || t.Pivot.ValueQuery != nil) {
+		sb.WriteString(" " + t.Pivot.SQL())
+	} else if t.Pivot != nil {
 		sb.WriteString(" ")
 		sb.WriteString(f.kw("PIVOT"))
 		sb.WriteString(" (")
@@ -1274,11 +1316,18 @@ func tableRefSQL(t *ast.TableReference, f *nodeFormatter) string {
 		sb.WriteString(f.kw("IN"))
 		sb.WriteString(" (")
 		sb.WriteString(strings.Join(t.Pivot.InValues, ", "))
-		sb.WriteString("))")
+		sb.WriteString(")")
+		if t.Pivot.DefaultOnNull != nil {
+			sb.WriteString(" " + f.kw("DEFAULT ON NULL") + " (" + exprSQL(t.Pivot.DefaultOnNull) + ")")
+		}
+		sb.WriteString(")")
 	}
 	if t.Unpivot != nil {
 		sb.WriteString(" ")
 		sb.WriteString(f.kw("UNPIVOT"))
+		if t.Unpivot.IncludeNulls {
+			sb.WriteString(" " + f.kw("INCLUDE NULLS"))
+		}
 		sb.WriteString(" (")
 		sb.WriteString(t.Unpivot.ValueColumn)
 		sb.WriteString(" ")
@@ -1291,7 +1340,16 @@ func tableRefSQL(t *ast.TableReference, f *nodeFormatter) string {
 		sb.WriteString(strings.Join(t.Unpivot.InColumns, ", "))
 		sb.WriteString("))")
 	}
-	if t.Alias != "" {
+	if t.TimeTravel != nil {
+		sb.WriteString(" " + t.TimeTravel.SQL())
+	}
+	if t.MatchRecognize != nil {
+		sb.WriteString(" " + t.MatchRecognize.SQL())
+	}
+	if t.ForSystemTime != nil {
+		sb.WriteString(" " + t.ForSystemTime.ToSQL())
+	}
+	if t.Alias != "" && t.Alias != t.ModifierInputAlias {
 		// PIVOT/UNPIVOT aliases conventionally use AS to avoid ambiguity
 		// with the closing paren of the clause.
 		if t.Pivot != nil || t.Unpivot != nil {
@@ -1302,6 +1360,9 @@ func tableRefSQL(t *ast.TableReference, f *nodeFormatter) string {
 			sb.WriteString(" ")
 		}
 		sb.WriteString(t.Alias)
+	}
+	if len(t.Columns) > 0 {
+		sb.WriteString("(" + strings.Join(t.Columns, ", ") + ")")
 	}
 	return sb.String()
 }
@@ -1338,10 +1399,17 @@ func joinSQL(j *ast.JoinClause, f *nodeFormatter) string {
 	sb.WriteString(" ")
 	sb.WriteString(tableRefSQL(&j.Right, f))
 	if j.Condition != nil {
-		sb.WriteString(" ")
-		sb.WriteString(f.kw("ON"))
-		sb.WriteString(" ")
-		sb.WriteString(exprSQL(j.Condition))
+		if j.Using {
+			sb.WriteString(" " + f.kw("USING") + " (")
+			if list, ok := j.Condition.(*ast.ListExpression); ok {
+				sb.WriteString(exprListSQL(list.Values))
+			} else {
+				sb.WriteString(exprSQL(j.Condition))
+			}
+			sb.WriteString(")")
+		} else {
+			sb.WriteString(" " + f.kw("ON") + " " + exprSQL(j.Condition))
+		}
 	}
 	return sb.String()
 }

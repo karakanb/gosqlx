@@ -42,12 +42,25 @@ func (p *Parser) parseSelectWithSetOperations() (ast.Statement, error) {
 	if err != nil {
 		return nil, err
 	}
+	if left, ok := leftStmt.(*ast.SelectStatement); ok &&
+		(p.isAnyType(models.TokenTypeUnion, models.TokenTypeExcept, models.TokenTypeIntersect) || p.isMinusSetOp()) &&
+		(len(left.OrderBy) > 0 || left.Limit != nil || left.Offset != nil || left.Fetch != nil) {
+		return nil, p.expectedError("parentheses around ordered or limited set branch")
+	}
 
-	// Check for set operations (UNION, EXCEPT, INTERSECT). MINUS is a
-	// Snowflake / Oracle synonym for EXCEPT; it tokenizes as a plain
-	// identifier, so match it by value.
+	return p.parseSetTail(leftStmt, 1)
+}
+
+func (p *Parser) parseSetTail(leftStmt ast.Statement, minPrecedence int) (ast.Statement, error) {
 	for p.isAnyType(models.TokenTypeUnion, models.TokenTypeExcept, models.TokenTypeIntersect) ||
 		p.isMinusSetOp() {
+		precedence := 1
+		if p.isType(models.TokenTypeIntersect) {
+			precedence = 2
+		}
+		if precedence < minPrecedence {
+			break
+		}
 		// Parse the set operation type
 		operationLiteral := p.currentToken.Token.Value
 		if p.isMinusSetOp() {
@@ -60,15 +73,30 @@ func (p *Parser) parseSelectWithSetOperations() (ast.Statement, error) {
 		if p.isType(models.TokenTypeAll) {
 			all = true
 			p.advance()
+		} else {
+			p.matchType(models.TokenTypeDistinct)
 		}
 
 		// Parse the right-hand SELECT statement
-		if !p.isType(models.TokenTypeSelect) {
-			return nil, p.expectedError("SELECT after set operation")
+		grouped := p.matchType(models.TokenTypeLParen)
+		var rightStmt ast.Statement
+		var err error
+		if grouped {
+			rightStmt, err = p.parseStatement()
+			if err == nil && !p.matchType(models.TokenTypeRParen) {
+				return nil, p.expectedError(") after set branch")
+			}
+		} else {
+			if !p.matchType(models.TokenTypeSelect) {
+				return nil, p.expectedError("SELECT after set operation")
+			}
+			rightStmt, err = p.parseSelectStatement()
+			if right, ok := rightStmt.(*ast.SelectStatement); ok && err == nil &&
+				(p.isAnyType(models.TokenTypeUnion, models.TokenTypeExcept, models.TokenTypeIntersect) || p.isMinusSetOp()) &&
+				(len(right.OrderBy) > 0 || right.Limit != nil || right.Offset != nil || right.Fetch != nil) {
+				return nil, p.expectedError("parentheses around ordered or limited set branch")
+			}
 		}
-		p.advance() // Consume SELECT
-
-		rightStmt, err := p.parseSelectStatement()
 		if err != nil {
 			return nil, goerrors.InvalidSetOperationError(
 				operationLiteral,
@@ -76,6 +104,12 @@ func (p *Parser) parseSelectWithSetOperations() (ast.Statement, error) {
 				p.currentLocation(),
 				"",
 			)
+		}
+		if !grouped {
+			rightStmt, err = p.parseSetTail(rightStmt, precedence+1)
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		// Create the set operation with left as the accumulated result
@@ -85,10 +119,41 @@ func (p *Parser) parseSelectWithSetOperations() (ast.Statement, error) {
 			All:      all,
 			Right:    rightStmt,
 		}
+		if !grouped {
+			switch right := rightStmt.(type) {
+			case *ast.SelectStatement:
+				setOp.OrderBy, setOp.Limit, setOp.Offset, setOp.Fetch = right.OrderBy, right.Limit, right.Offset, right.Fetch
+				right.OrderBy, right.Limit, right.Offset, right.Fetch = nil, nil, nil, nil
+			case *ast.SetOperation:
+				setOp.OrderBy, setOp.Limit, setOp.Offset, setOp.Fetch = right.OrderBy, right.Limit, right.Offset, right.Fetch
+				right.OrderBy, right.Limit, right.Offset, right.Fetch = nil, nil, nil, nil
+			}
+		}
 
 		leftStmt = setOp // The result becomes the left side for any subsequent operations
 	}
 
+	if set, ok := leftStmt.(*ast.SetOperation); ok {
+		var err error
+		if p.isType(models.TokenTypeOrder) {
+			set.OrderBy, err = p.parseOrderByClause()
+			if err != nil {
+				return nil, err
+			}
+		}
+		if p.isType(models.TokenTypeLimit) || p.isType(models.TokenTypeOffset) {
+			set.Limit, set.Offset, err = p.parseLimitOffsetClause()
+			if err != nil {
+				return nil, err
+			}
+		}
+		if p.isType(models.TokenTypeFetch) {
+			set.Fetch, err = p.parseFetchClause()
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
 	return leftStmt, nil
 }
 

@@ -230,25 +230,25 @@ func TestParser_MultipleSetOperations(t *testing.T) {
 		t.Fatalf("Expected SetOperation, got %T", astObj.Statements[0])
 	}
 
-	// Verify the outer operation is INTERSECT (the last one parsed)
-	if outerSetOp.Operator != "INTERSECT" {
-		t.Errorf("Expected outer operation to be INTERSECT, got %s", outerSetOp.Operator)
+	// INTERSECT binds more tightly than UNION, regardless of textual order.
+	if outerSetOp.Operator != "UNION" {
+		t.Errorf("Expected outer operation to be UNION, got %s", outerSetOp.Operator)
 	}
 
-	// Verify the left side is also a SetOperation (UNION)
-	leftSetOp, ok := outerSetOp.Left.(*ast.SetOperation)
+	// The right branch is the INTERSECT of the final two SELECTs.
+	rightSetOp, ok := outerSetOp.Right.(*ast.SetOperation)
 	if !ok {
-		t.Errorf("Expected left side to be SetOperation, got %T", outerSetOp.Left)
+		t.Errorf("Expected right side to be SetOperation, got %T", outerSetOp.Right)
 	} else {
-		if leftSetOp.Operator != "UNION" {
-			t.Errorf("Expected left operation to be UNION, got %s", leftSetOp.Operator)
+		if rightSetOp.Operator != "INTERSECT" {
+			t.Errorf("Expected right operation to be INTERSECT, got %s", rightSetOp.Operator)
 		}
 	}
 
-	// Verify the right side is a SELECT statement
-	_, rightOk := outerSetOp.Right.(*ast.SelectStatement)
-	if !rightOk {
-		t.Errorf("Expected right side to be SELECT statement, got %T", outerSetOp.Right)
+	// The left branch remains the first SELECT.
+	_, leftOK := outerSetOp.Left.(*ast.SelectStatement)
+	if !leftOK {
+		t.Errorf("Expected left side to be SELECT statement, got %T", outerSetOp.Left)
 	}
 }
 
@@ -291,21 +291,16 @@ func TestParser_SetOperationWithCTE(t *testing.T) {
 		t.Errorf("Expected UNION operator, got %s", setOp.Operator)
 	}
 
-	// The left side should be a SELECT with a WITH clause
+	// The leading WITH belongs to the whole set, not only the left branch.
 	leftSelect, ok := setOp.Left.(*ast.SelectStatement)
 	if !ok {
 		t.Errorf("Expected left side to be SELECT statement, got %T", setOp.Left)
 	} else {
-		// Verify WITH clause exists
-		if leftSelect.With == nil {
-			t.Error("Expected WITH clause in left SELECT")
-		} else {
-			if len(leftSelect.With.CTEs) != 1 {
-				t.Errorf("Expected 1 CTE, got %d", len(leftSelect.With.CTEs))
-			}
-			if len(leftSelect.With.CTEs) > 0 && leftSelect.With.CTEs[0].Name != "regional" {
-				t.Errorf("Expected CTE name 'regional', got '%s'", leftSelect.With.CTEs[0].Name)
-			}
+		if leftSelect.With != nil {
+			t.Error("WITH must not be scoped only to the left SELECT")
 		}
+	}
+	if setOp.With == nil || len(setOp.With.CTEs) != 1 || setOp.With.CTEs[0].Name != "regional" {
+		t.Fatalf("Expected regional CTE on set operation, got %+v", setOp.With)
 	}
 }

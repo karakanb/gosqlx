@@ -336,7 +336,7 @@ func (p *Parser) parseComparisonExpression() (ast.Expression, error) {
 		}
 
 		// Parse the right side of the expression
-		right, err := p.parsePrimaryExpression()
+		right, err := p.parseStringConcatExpression()
 		if err != nil {
 			return nil, err
 		}
@@ -351,6 +351,34 @@ func (p *Parser) parseComparisonExpression() (ast.Expression, error) {
 	}
 
 	return left, nil
+}
+
+// PostgreSQL gives OPERATOR(schema.symbol) the generic operator precedence.
+// Preserve the operator name; lineage cannot infer an arbitrary catalog body.
+func (p *Parser) parseCustomOperator() (*ast.CustomBinaryOperator, error) {
+	p.advance()
+	if !p.matchType(models.TokenTypeLParen) {
+		return nil, p.expectedError("( after OPERATOR")
+	}
+	parts := []string{}
+	if p.isIdentifier() && p.peekToken().Token.Type == models.TokenTypePeriod {
+		parts = append(parts, p.currentToken.Token.Value)
+		p.advance()
+		p.advance()
+	}
+	var name strings.Builder
+	for !p.isType(models.TokenTypeRParen) && !p.isType(models.TokenTypeEOF) {
+		value := p.currentToken.Token.Value
+		if value == "" || strings.Trim(value, "+-*/<>=~!@#%^&|`?") != "" {
+			return nil, p.expectedError("operator symbol")
+		}
+		name.WriteString(value)
+		p.advance()
+	}
+	if name.Len() == 0 || !p.matchType(models.TokenTypeRParen) {
+		return nil, p.expectedError(") after operator symbol")
+	}
+	return &ast.CustomBinaryOperator{Parts: append(parts, name.String())}, nil
 }
 
 // parseArrayAccessExpression parses array subscript and slice expressions.

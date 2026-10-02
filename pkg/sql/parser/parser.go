@@ -613,6 +613,24 @@ func (p *Parser) parseStatement() (ast.Statement, error) {
 	// O(1) switch dispatch on Token.Type (compiles to jump table).
 	// All tokens are normalized at parse entry so Type is always set.
 	switch p.currentToken.Token.Type {
+	case models.TokenTypeLParen:
+		p.depth++
+		defer func() { p.depth-- }()
+		if p.depth > MaxRecursionDepth {
+			return nil, goerrors.RecursionDepthLimitError(p.depth, MaxRecursionDepth, p.currentLocation(), "")
+		}
+		p.advance()
+		stmt, err := p.parseStatement()
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := stmt.(ast.QueryExpression); !ok {
+			return nil, p.expectedError("query in parentheses")
+		}
+		if !p.matchType(models.TokenTypeRParen) {
+			return nil, p.expectedError(") after query")
+		}
+		return p.parseSetTail(stmt, 1)
 	case models.TokenTypeWith:
 		return p.parseWithStatement()
 	case models.TokenTypeSelect:
@@ -753,6 +771,22 @@ func (p *Parser) parseStatement() (ast.Statement, error) {
 			}
 		}
 	case models.TokenTypeIdentifier:
+		upper := strings.ToUpper(p.currentToken.Token.Value)
+		if p.currentToken.Token.Quote == 0 && (upper == "BEGIN" || upper == "COMMIT" || upper == "ROLLBACK") {
+			p.advance()
+			if p.isTokenMatch("TRANSACTION") || p.isTokenMatch("WORK") {
+				p.advance()
+			}
+			return &ast.TransactionStatement{Command: upper}, nil
+		}
+		if (p.dialect == "sqlserver" || p.dialect == "fabric" || p.dialect == "mysql" || p.dialect == "doris" || p.dialect == "starrocks") && strings.EqualFold(p.currentToken.Token.Value, "USE") {
+			p.advance()
+			name, err := p.parseQualifiedName()
+			if err != nil {
+				return nil, err
+			}
+			return &ast.UseStatement{Name: name}, nil
+		}
 		// PRAGMA may be tokenized as IDENTIFIER when no dialect-specific keyword
 		// set is active (e.g. when using the default PostgreSQL tokenizer dialect).
 		// Support it as a statement keyword regardless of tokenizer dialect.
@@ -1084,6 +1118,10 @@ func (p *Parser) parseQualifiedName() (string, error) {
 	// Check for schema.table or db.schema.table
 	for p.isType(models.TokenTypePeriod) {
 		p.advance() // Consume .
+		if p.isType(models.TokenTypePeriod) && (p.dialect == "sqlserver" || p.dialect == "fabric") {
+			name += ".dbo"
+			continue
+		}
 		if !p.isIdentifier() && !p.isNonReservedKeyword() {
 			return "", p.expectedError("identifier after .")
 		}
@@ -1181,6 +1219,9 @@ func (p *Parser) parseAlterTableStmt() (ast.Statement, error) {
 
 // isJoinKeyword checks if current token is a JOIN-related keyword
 func (p *Parser) isJoinKeyword() bool {
+	if (p.isTokenMatch("SEMI") || p.isTokenMatch("ANTI")) && p.peekToken().Token.Type == models.TokenTypeJoin {
+		return true
+	}
 	// ClickHouse: LEFT ARRAY JOIN is not a regular JOIN — exclude it so
 	// the ARRAY JOIN parser handles it separately.
 	if p.dialect == string(keywords.DialectClickHouse) &&

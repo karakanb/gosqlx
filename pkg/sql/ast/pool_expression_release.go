@@ -260,6 +260,14 @@ func putExpressionImpl(expr Expression, depth int) {
 			e.Type = ""
 			literalValuePool.Put(e)
 
+		case *StarExpression:
+			for _, replacement := range e.Replace {
+				workQueue = append(workQueue, replacement)
+			}
+			e.Replace = nil
+		case *FieldAccess:
+			workQueue = append(workQueue, e.Expr)
+			e.Expr = nil
 		case *FunctionCall:
 			for i := range e.Arguments {
 				if e.Arguments[i] != nil {

@@ -71,6 +71,17 @@ const (
 	// features: SEQUENCE DDL (10.3+), system-versioned temporal tables (10.3.4+),
 	// CONNECT BY hierarchical queries (10.2+), and index visibility (10.6+).
 	DialectMariaDB SQLDialect = "mariadb"
+
+	// Analytical dialects share ANSI grammar but retain separate parser gates
+	// for projection modifiers, table functions and lateral views.
+	DialectDuckDB     SQLDialect = "duckdb"
+	DialectSpark      SQLDialect = "spark"
+	DialectDatabricks SQLDialect = "databricks"
+	DialectTrino      SQLDialect = "trino"
+	DialectAthena     SQLDialect = "athena"
+	DialectDoris      SQLDialect = "doris"
+	DialectStarRocks  SQLDialect = "starrocks"
+	DialectFabric     SQLDialect = "fabric"
 )
 
 // DialectKeywords returns the additional keywords for a specific dialect.
@@ -89,18 +100,18 @@ func DialectKeywords(dialect SQLDialect) []Keyword {
 	switch dialect {
 	case DialectSnowflake:
 		return SNOWFLAKE_SPECIFIC
-	case DialectMySQL:
+	case DialectMySQL, DialectDoris, DialectStarRocks:
 		return MYSQL_SPECIFIC
 	case DialectMariaDB:
 		combined := make([]Keyword, 0, len(MYSQL_SPECIFIC)+len(MARIADB_SPECIFIC))
 		combined = append(combined, MYSQL_SPECIFIC...)
 		combined = append(combined, MARIADB_SPECIFIC...)
 		return combined
-	case DialectPostgreSQL:
+	case DialectPostgreSQL, DialectDuckDB, DialectRedshift:
 		return POSTGRESQL_SPECIFIC
 	case DialectSQLite:
 		return SQLITE_SPECIFIC
-	case DialectSQLServer:
+	case DialectSQLServer, DialectFabric:
 		return SQLSERVER_SPECIFIC
 	case DialectOracle:
 		return ORACLE_SPECIFIC
@@ -153,6 +164,8 @@ func AllDialects() []SQLDialect {
 		DialectBigQuery,
 		DialectRedshift,
 		DialectClickHouse,
+		DialectDuckDB, DialectSpark, DialectDatabricks, DialectTrino,
+		DialectAthena, DialectDoris, DialectStarRocks, DialectFabric,
 	}
 }
 

@@ -122,10 +122,24 @@ func (p *Parser) parseStringConcatExpression() (ast.Expression, error) {
 	}
 
 	// Handle || (string concatenation) operator (left-associative)
-	for p.isType(models.TokenTypeStringConcat) {
+	for p.isAnyType(models.TokenTypeStringConcat, models.TokenTypeAmpersand, models.TokenTypePipe, models.TokenTypeSharp, models.TokenTypeShiftLeft, models.TokenTypeShiftRight) ||
+		(p.isAnyType(models.TokenTypeLt, models.TokenTypeGt) && p.currentToken.Token.Type == p.peekToken().Token.Type) ||
+		((p.dialect == "postgresql" || p.dialect == "generic") && p.isTokenMatch("OPERATOR")) {
 		opPos := p.currentLocation()
 		operator := p.currentToken.Token.Value
-		p.advance() // Consume ||
+		var custom *ast.CustomBinaryOperator
+		if p.isTokenMatch("OPERATOR") {
+			custom, err = p.parseCustomOperator()
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			if p.isAnyType(models.TokenTypeLt, models.TokenTypeGt) {
+				operator += operator
+				p.advance()
+			}
+			p.advance()
+		}
 
 		right, err := p.parseAdditiveExpression()
 		if err != nil {
@@ -135,6 +149,7 @@ func (p *Parser) parseStringConcatExpression() (ast.Expression, error) {
 		left = &ast.BinaryExpression{
 			Left:     left,
 			Operator: operator,
+			CustomOp: custom,
 			Right:    right,
 			Pos:      opPos,
 		}
@@ -213,6 +228,20 @@ func (p *Parser) parseJSONExpression() (ast.Expression, error) {
 	left, err := p.parsePrimaryExpression()
 	if err != nil {
 		return nil, err
+	}
+	for p.isType(models.TokenTypePeriod) || p.isType(models.TokenTypeLBracket) {
+		if p.matchType(models.TokenTypePeriod) {
+			if !p.isIdentifier() && !p.isNonReservedKeyword() {
+				return nil, p.expectedError("field after dot")
+			}
+			left = &ast.FieldAccess{Expr: left, Name: p.currentToken.Token.Value}
+			p.advance()
+		} else {
+			left, err = p.parseArrayAccessExpression(left)
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	// Snowflake VARIANT path: `expr:field[.field|[idx]]*`. Must run before

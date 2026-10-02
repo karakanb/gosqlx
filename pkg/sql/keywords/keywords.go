@@ -337,14 +337,16 @@ func New(dialect SQLDialect, ignoreCase bool) *Keywords {
 
 	// Add dialect-specific keywords
 	switch dialect {
-	case DialectMySQL:
+	case DialectMySQL, DialectDoris, DialectStarRocks:
 		k.addKeywordsWithCategory(MYSQL_SPECIFIC)
 	case DialectMariaDB:
 		// MariaDB is a superset of MySQL — load MySQL base first, then MariaDB extras
 		k.addKeywordsWithCategory(MYSQL_SPECIFIC)
 		k.addKeywordsWithCategory(MARIADB_SPECIFIC)
-	case DialectPostgreSQL:
+	case DialectPostgreSQL, DialectDuckDB, DialectRedshift:
 		k.addKeywordsWithCategory(POSTGRESQL_SPECIFIC)
+	case DialectFabric:
+		k.addKeywordsWithCategory(SQLSERVER_SPECIFIC)
 	case DialectSQLite:
 		k.addKeywordsWithCategory(SQLITE_SPECIFIC)
 	case DialectSnowflake:

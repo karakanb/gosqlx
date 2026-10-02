@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Experimental `pkg/sql/lineage.Analyze`: schema-aware output-column lineage,
+  ordered star expansion and exclusions/replacements, nested/recursive CTEs,
+  derived/correlated/lateral scopes, positional set operations, structured values,
+  table functions, named windows, separate non-selected dependencies, and bounded
+  type propagation. Ambiguous, missing-schema, and unsupported query analyses return errors;
+  unsupported output expressions preserve healthy siblings and positional diagnostics.
+- Schema-aware static PIVOT/UNPIVOT and MATCH_RECOGNIZE output schemas, snapshot
+  and CHANGES metadata, hierarchy controls, and DEFAULT ON NULL dependencies.
+- `lineage.ExtractQuery` for explicit CREATE/INSERT query unwrapping and
+  `gosqlx.ExtractTableDependencies` for physical references with CTE scoping,
+  write targets and statement-batch/USE handling.
+- Native dialect options for DuckDB, Spark, Databricks, Trino, Athena, Fabric,
+  Doris and StarRocks with tested syntax and identifier rules (not full dialect equivalence).
+- Offline JSON-lines lineage probe and SQLGlot baseline comparison harness in
+  `cmd/gosqlx-probe`.
+
+### Fixed
+
+- Preserve leading CTE definitions across chains of three or more set-operation
+  branches without leaking branch-local definitions. A leading WITH now belongs
+  to `SetOperation.With`, not its left SELECT; AST consumers must inspect that field.
+- Distinguish JOIN USING from a bare ON expression in the AST.
+- Preserve comma/explicit JOIN association and ON visibility with `JoinClause.FromIndex`;
+  retain modifier aliases and expressions through query extraction and rendering.
+- Retain CTAS queries, derived set queries/column aliases, parenthesized set
+  branches and set-level ordering/limits. INTERSECT binds tighter than UNION/EXCEPT.
+- Avoid duplicate traversal of set/CTE branches in qualified reference extraction
+  and duplicate pooled ownership of FROM subqueries through JOIN-left references.
+
 ## [1.14.0] - 2026-04-12 — Dialect-Aware Transforms, Snowflake 100%, Schema Introspection
 
 Headline themes: dialect-aware transforms, Snowflake at 100% of the QA corpus, ClickHouse significantly expanded (83% of the QA corpus, up from 53%), live schema introspection, SQL transpilation, and first-class integration sub-modules (OpenTelemetry and GORM). Drop-in upgrade from v1.13.0 — no breaking changes.

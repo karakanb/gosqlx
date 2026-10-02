@@ -21,7 +21,6 @@ package parser
 import (
 	"strings"
 
-	goerrors "github.com/ajitpratap0/GoSQLX/pkg/errors"
 	"github.com/ajitpratap0/GoSQLX/pkg/models"
 	"github.com/ajitpratap0/GoSQLX/pkg/sql/ast"
 	"github.com/ajitpratap0/GoSQLX/pkg/sql/keywords"
@@ -48,15 +47,11 @@ func (p *Parser) parseFromTableReference() (ast.TableReference, error) {
 			return tableRef, p.expectedError("SELECT in derived table")
 		}
 
-		// Consume SELECT token before calling parseSelectStatement
-		p.advance() // Consume SELECT
-
-		// Parse the subquery
-		subquery, err := p.parseSelectStatement()
+		subquery, err := p.parseStatement()
 		if err != nil {
 			return tableRef, err
 		}
-		selectStmt, ok := subquery.(*ast.SelectStatement)
+		query, ok := subquery.(ast.QueryExpression)
 		if !ok {
 			return tableRef, p.expectedError("SELECT statement in derived table")
 		}
@@ -67,9 +62,11 @@ func (p *Parser) parseFromTableReference() (ast.TableReference, error) {
 		}
 		p.advance() // Consume )
 
-		tableRef = ast.TableReference{
-			Subquery: selectStmt,
-			Lateral:  isLateral,
+		tableRef.Lateral = isLateral
+		if selectStmt, ok := query.(*ast.SelectStatement); ok {
+			tableRef.Subquery = selectStmt
+		} else {
+			tableRef.Query = query
 		}
 	} else if p.dialect == string(keywords.DialectSnowflake) &&
 		p.isType(models.TokenTypePlaceholder) && strings.HasPrefix(p.currentToken.Token.Value, "@") {
@@ -104,14 +101,25 @@ func (p *Parser) parseFromTableReference() (ast.TableReference, error) {
 		}
 	} else {
 		// Parse regular table name (supports schema.table qualification)
+		nameQuoted := p.currentToken.Token.Quote != 0
 		qualifiedName, err := p.parseQualifiedName()
 		if err != nil {
 			return tableRef, err
 		}
 
 		tableRef = ast.TableReference{
-			Name:    qualifiedName,
-			Lateral: isLateral,
+			Name:       qualifiedName,
+			NameQuoted: nameQuoted,
+			Lateral:    isLateral,
+		}
+
+		// T-SQL also allows legacy table hints without WITH, before the alias.
+		if (p.dialect == "sqlserver" || p.dialect == "fabric") && p.isType(models.TokenTypeLParen) {
+			hints, err := p.parseTableHints()
+			if err != nil {
+				return tableRef, err
+			}
+			tableRef.TableHints = hints
 		}
 
 		// Function-call table reference (Snowflake FLATTEN, TABLE(...),
@@ -182,7 +190,7 @@ func (p *Parser) parseFromTableReference() (ast.TableReference, error) {
 	// Similarly, START followed by WITH is a hierarchical query seed, not an alias.
 	// Don't consume PIVOT/UNPIVOT as a table alias — they are contextual
 	// keywords in SQL Server/Oracle and must reach the pivot-clause parser below.
-	if (p.isIdentifier() || p.isType(models.TokenTypeAs)) && !p.isMariaDBClauseStart() && !p.isPivotKeyword() && !p.isUnpivotKeyword() && !p.isQualifyKeyword() && !p.isMinusSetOp() && !p.isSnowflakeTimeTravelStart() && !p.isSampleKeyword() && !p.isMatchRecognizeKeyword() && !p.isWindowClauseKeyword() && !p.isSettingsKeyword() {
+	if (p.isIdentifier() || p.isType(models.TokenTypeAs)) && !p.isJoinKeyword() && !p.isMariaDBClauseStart() && !p.isPivotKeyword() && !p.isUnpivotKeyword() && !p.isQualifyKeyword() && !p.isMinusSetOp() && !p.isSnowflakeTimeTravelStart() && !p.isSampleKeyword() && !p.isMatchRecognizeKeyword() && !p.isWindowClauseKeyword() && !p.isSettingsKeyword() {
 		if p.isType(models.TokenTypeAs) {
 			p.advance() // Consume AS
 			if !p.isIdentifier() {
@@ -194,9 +202,24 @@ func (p *Parser) parseFromTableReference() (ast.TableReference, error) {
 			p.advance()
 		}
 	}
+	if tableRef.Alias != "" && p.matchType(models.TokenTypeLParen) {
+		for {
+			if !p.isIdentifier() && !p.isNonReservedKeyword() {
+				return tableRef, p.expectedError("column alias")
+			}
+			tableRef.Columns = append(tableRef.Columns, p.currentToken.Token.Value)
+			p.advance()
+			if !p.matchType(models.TokenTypeComma) {
+				break
+			}
+		}
+		if !p.matchType(models.TokenTypeRParen) {
+			return tableRef, p.expectedError(") after column aliases")
+		}
+	}
 
 	// MariaDB FOR SYSTEM_TIME temporal query (10.3.4+)
-	if p.isMariaDB() && p.isType(models.TokenTypeFor) {
+	if (p.isMariaDB() || p.dialect == string(keywords.DialectSQLServer) || p.dialect == string(keywords.DialectFabric)) && p.isType(models.TokenTypeFor) {
 		// Only parse as FOR SYSTEM_TIME if next token is SYSTEM_TIME
 		next := p.peekToken()
 		if strings.EqualFold(next.Token.Value, "SYSTEM_TIME") {
@@ -206,6 +229,10 @@ func (p *Parser) parseFromTableReference() (ast.TableReference, error) {
 				return tableRef, err
 			}
 			tableRef.ForSystemTime = sysTime
+			// SQL Server places the relation alias after the temporal clause.
+			if p.isType(models.TokenTypeAs) || (p.canBeAlias() && !p.isJoinKeyword()) {
+				p.parsePivotAlias(&tableRef)
+			}
 		}
 	}
 
@@ -222,6 +249,7 @@ func (p *Parser) parseFromTableReference() (ast.TableReference, error) {
 
 	// SQL Server / Oracle PIVOT clause
 	if p.isPivotKeyword() {
+		tableRef.ModifierInputAlias = tableRef.Alias
 		pivot, err := p.parsePivotClause()
 		if err != nil {
 			return tableRef, err
@@ -232,6 +260,7 @@ func (p *Parser) parseFromTableReference() (ast.TableReference, error) {
 
 	// SQL Server / Oracle UNPIVOT clause
 	if p.isUnpivotKeyword() {
+		tableRef.ModifierInputAlias = tableRef.Alias
 		unpivot, err := p.parseUnpivotClause()
 		if err != nil {
 			return tableRef, err
@@ -242,6 +271,7 @@ func (p *Parser) parseFromTableReference() (ast.TableReference, error) {
 
 	// Snowflake / Oracle MATCH_RECOGNIZE clause
 	if p.isMatchRecognizeKeyword() {
+		tableRef.ModifierInputAlias = tableRef.Alias
 		mr, err := p.parseMatchRecognize()
 		if err != nil {
 			return tableRef, err
@@ -262,123 +292,57 @@ func (p *Parser) parseFromTableReference() (ast.TableReference, error) {
 
 // parseJoinedTableRef parses the table reference on the right-hand side of a JOIN.
 func (p *Parser) parseJoinedTableRef(joinType string) (ast.TableReference, error) {
-	var ref ast.TableReference
+	if !p.isIdentifier() && !p.isNonReservedKeyword() && !p.isAnyType(models.TokenTypeLParen, models.TokenTypeLateral) {
+		return ast.TableReference{}, p.expectedError("table name after " + joinType + " JOIN")
+	}
+	return p.parseFromTableReference()
+}
 
-	// Optional LATERAL (PostgreSQL)
-	isLateral := false
-	if p.isType(models.TokenTypeLateral) {
-		isLateral = true
+// parseLateralView models Spark's generator as a lateral table function.
+func (p *Parser) parseLateralView() (ast.TableReference, error) {
+	ref := ast.TableReference{Lateral: true}
+	p.advance() // LATERAL
+	if !p.matchType(models.TokenTypeView) {
+		return ref, p.expectedError("VIEW after LATERAL")
+	}
+	p.matchType(models.TokenTypeOuter) // Outer changes row retention, not column origins.
+	if !p.isIdentifier() {
+		return ref, p.expectedError("generator function")
+	}
+	name := p.currentToken.Token.Value
+	p.advance()
+	f, err := p.parseFunctionCall(name)
+	if err != nil {
+		return ref, err
+	}
+	ref.TableFunc = f
+	if p.isIdentifier() {
+		ref.Alias = p.currentToken.Token.Value
 		p.advance()
 	}
-
-	if p.isType(models.TokenTypeLParen) {
-		// Derived table (subquery)
-		p.advance() // Consume (
-
-		if !p.isType(models.TokenTypeSelect) && !p.isType(models.TokenTypeWith) {
-			return ref, p.expectedError("SELECT in derived table")
-		}
-		p.advance() // Consume SELECT
-
-		subquery, err := p.parseSelectStatement()
-		if err != nil {
-			return ref, err
-		}
-		selectStmt, ok := subquery.(*ast.SelectStatement)
-		if !ok {
-			return ref, p.expectedError("SELECT statement in derived table")
-		}
-
-		if !p.isType(models.TokenTypeRParen) {
-			return ref, p.expectedError(")")
-		}
-		p.advance() // Consume )
-
-		ref = ast.TableReference{Subquery: selectStmt, Lateral: isLateral}
-	} else {
-		joinedName, err := p.parseQualifiedName()
-		if err != nil {
-			return ref, goerrors.ExpectedTokenError(
-				"table name after "+joinType+" JOIN",
-				p.currentToken.Token.Type.String(),
-				p.currentLocation(),
-				"",
-			)
-		}
-		ref = ast.TableReference{Name: joinedName, Lateral: isLateral}
+	if !p.matchType(models.TokenTypeAs) {
+		return ref, p.expectedError("AS after lateral view")
 	}
-
-	// Optional alias.
-	// Guard: in MariaDB, CONNECT followed by BY is a hierarchical query clause, not an alias.
-	// Similarly, START followed by WITH is a hierarchical query seed, not an alias.
-	// Don't consume PIVOT/UNPIVOT as a table alias — they are contextual
-	// keywords in SQL Server/Oracle and must reach the pivot-clause parser below.
-	if (p.isIdentifier() || p.isType(models.TokenTypeAs)) && !p.isMariaDBClauseStart() && !p.isPivotKeyword() && !p.isUnpivotKeyword() && !p.isQualifyKeyword() && !p.isMinusSetOp() && !p.isSnowflakeTimeTravelStart() && !p.isSampleKeyword() && !p.isMatchRecognizeKeyword() && !p.isWindowClauseKeyword() && !p.isSettingsKeyword() {
-		if p.isType(models.TokenTypeAs) {
-			p.advance()
-			if !p.isIdentifier() {
-				return ref, p.expectedError("alias after AS")
-			}
+	for {
+		if !p.isIdentifier() {
+			return ref, p.expectedError("generator output alias")
 		}
-		if p.isIdentifier() {
-			ref.Alias = p.currentToken.Token.Value
-			p.advance()
+		ref.Columns = append(ref.Columns, p.currentToken.Token.Value)
+		p.advance()
+		if !p.matchType(models.TokenTypeComma) {
+			break
 		}
 	}
-
-	// MariaDB FOR SYSTEM_TIME temporal query (10.3.4+)
-	if p.isMariaDB() && p.isType(models.TokenTypeFor) {
-		// Only parse as FOR SYSTEM_TIME if next token is SYSTEM_TIME
-		next := p.peekToken()
-		if strings.EqualFold(next.Token.Value, "SYSTEM_TIME") {
-			p.advance() // Consume FOR
-			sysTime, err := p.parseForSystemTimeClause()
-			if err != nil {
-				return ref, err
-			}
-			ref.ForSystemTime = sysTime
-		}
-	}
-
-	// SQL Server table hints
-	if p.dialect == string(keywords.DialectSQLServer) && p.isType(models.TokenTypeWith) {
-		if p.peekToken().Token.Type == models.TokenTypeLParen {
-			hints, err := p.parseTableHints()
-			if err != nil {
-				return ref, err
-			}
-			ref.TableHints = hints
-		}
-	}
-
-	// SQL Server / Oracle PIVOT clause
-	if p.isPivotKeyword() {
-		pivot, err := p.parsePivotClause()
-		if err != nil {
-			return ref, err
-		}
-		ref.Pivot = pivot
-		p.parsePivotAlias(&ref)
-	}
-
-	// SQL Server / Oracle UNPIVOT clause
-	if p.isUnpivotKeyword() {
-		unpivot, err := p.parseUnpivotClause()
-		if err != nil {
-			return ref, err
-		}
-		ref.Unpivot = unpivot
-		p.parsePivotAlias(&ref)
-	}
-
 	return ref, nil
 }
 
 // parseTableHints parses SQL Server table hints: WITH (NOLOCK), WITH (ROWLOCK, UPDLOCK), etc.
 // Called when current token is WITH and peek is LParen.
 func (p *Parser) parseTableHints() ([]string, error) {
-	p.advance() // Consume WITH
-	p.advance() // Consume (
+	p.matchType(models.TokenTypeWith)
+	if !p.matchType(models.TokenTypeLParen) {
+		return nil, p.expectedError("( before table hints")
+	}
 
 	var hints []string
 	for {
@@ -386,7 +350,7 @@ func (p *Parser) parseTableHints() ([]string, error) {
 			break
 		}
 		hint := strings.ToUpper(p.currentToken.Token.Value)
-		if hint == "" {
+		if hint == "" || p.isType(models.TokenTypeEOF) {
 			return nil, p.expectedError("table hint inside WITH (...)")
 		}
 		hints = append(hints, hint)

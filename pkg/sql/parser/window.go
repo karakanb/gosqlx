@@ -79,10 +79,21 @@ func (p *Parser) parseFunctionCall(funcName string) (*ast.FunctionCall, error) {
 			if err != nil {
 				return nil, err
 			}
+			if strings.EqualFold(funcName, "STRUCT") && p.matchType(models.TokenTypeAs) {
+				if !p.isIdentifier() && !p.isNonReservedKeyword() {
+					return nil, p.expectedError("STRUCT field alias")
+				}
+				arg = &ast.AliasedExpression{Expr: arg, Alias: p.currentToken.Token.Value}
+				p.advance()
+			}
 			arguments = append(arguments, arg)
 
 			// Check for comma or end of arguments
-			if p.isType(models.TokenTypeComma) {
+			if strings.EqualFold(funcName, "SUBSTRING") &&
+				((len(arguments) == 1 && p.isType(models.TokenTypeFrom)) ||
+					(len(arguments) == 2 && p.isType(models.TokenTypeFor))) {
+				p.advance() // SQL-standard SUBSTRING(string FROM start FOR length).
+			} else if p.isType(models.TokenTypeComma) {
 				p.advance() // Consume comma
 			} else if p.isType(models.TokenTypeRParen) || p.isType(models.TokenTypeOrder) {
 				break
@@ -373,6 +384,10 @@ func (p *Parser) parseWindowSpec() (*ast.WindowSpec, error) {
 	p.advance() // Consume (
 
 	windowSpec := &ast.WindowSpec{}
+	if p.isIdentifier() && !p.isTokenMatch("ROWS") && !p.isTokenMatch("RANGE") && !p.isTokenMatch("GROUPS") {
+		windowSpec.BaseName = p.currentToken.Token.Value
+		p.advance()
+	}
 
 	// Parse PARTITION BY clause
 	if p.isType(models.TokenTypePartition) {

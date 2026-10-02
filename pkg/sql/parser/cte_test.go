@@ -378,3 +378,32 @@ func TestParser_MaterializedCTE(t *testing.T) {
 }
 
 // Note: boolPtr helper is defined in ddl_test.go
+
+func TestParser_CTEPreservedAcrossUnionChain(t *testing.T) {
+	tree, err := ParseWithDialect("WITH c AS (SELECT id FROM source) SELECT id FROM c UNION ALL SELECT id FROM c UNION ALL SELECT id FROM c", "postgresql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ast.ReleaseAST(tree)
+	root, ok := tree.Statements[0].(*ast.SetOperation)
+	if !ok {
+		t.Fatalf("expected set operation, got %T", tree.Statements[0])
+	}
+	var left ast.Statement = tree.Statements[0]
+	branches := 1
+	for {
+		set, ok := left.(*ast.SetOperation)
+		if !ok {
+			break
+		}
+		branches++
+		left = set.Left
+	}
+	sel, ok := left.(*ast.SelectStatement)
+	if !ok || branches != 3 {
+		t.Fatalf("expected three-branch UNION with SELECT on left, got %T (%d)", left, branches)
+	}
+	if root.With == nil || len(root.With.CTEs) != 1 || root.With.CTEs[0].Name != "c" || sel.With != nil {
+		t.Fatalf("leading WITH must belong to the full set query: %+v", root.With)
+	}
+}

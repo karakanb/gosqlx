@@ -62,6 +62,9 @@ func preprocessTokens(tokens []models.TokenWithSpan) []models.TokenWithSpan {
 // expandCompoundToken returns the expansion of a compound token such as
 // INNER_JOIN → [INNER, JOIN]. Returns nil if the token is not compound.
 func expandCompoundToken(t models.TokenWithSpan) []models.TokenWithSpan {
+	if t.Token.Quote != 0 {
+		return nil
+	}
 	makeTwo := func(t1Type models.TokenType, t1Val, t2Val string, t2Type models.TokenType) []models.TokenWithSpan {
 		return []models.TokenWithSpan{
 			{Token: models.Token{Type: t1Type, Value: t1Val}, Start: t.Start, End: t.End},
@@ -99,7 +102,10 @@ func expandCompoundToken(t models.TokenWithSpan) []models.TokenWithSpan {
 
 	// Value-based compound token matching (tokenizer may produce these as
 	// TokenTypeKeyword with a multi-word value).
-	switch t.Token.Value {
+	if t.Token.Type != models.TokenTypeKeyword && t.Token.Type != models.TokenTypeIdentifier {
+		return nil
+	}
+	switch toUpper(t.Token.Value) {
 	case "INNER JOIN":
 		return makeTwo(models.TokenTypeInner, "INNER", "JOIN", models.TokenTypeJoin)
 	case "LEFT JOIN":
@@ -130,6 +136,9 @@ func expandCompoundToken(t models.TokenWithSpan) []models.TokenWithSpan {
 // normalizeToken maps a TokenWithSpan to a canonical form expected by the
 // parser. Type mismatches that existed in the tokenizer are corrected here.
 func normalizeToken(t models.TokenWithSpan) models.TokenWithSpan {
+	if t.Token.Quote != 0 {
+		return t
+	}
 	// TokenTypeMul (*) is the same symbol as TokenTypeAsterisk for the
 	// parser. The parser explicitly checks both types wherever '*' can appear
 	// (SELECT list wildcard, table.* qualified wildcard, COUNT(*) argument).

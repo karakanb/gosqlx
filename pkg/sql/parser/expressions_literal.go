@@ -65,7 +65,8 @@ func (p *Parser) parsePrimaryExpression() (ast.Expression, error) {
 	// an identifier (the snowflake keyword table is not wired into the
 	// tokenizer); detect by name when followed by '('.
 	if (p.isType(models.TokenTypeIdentifier) || p.isType(models.TokenTypeKeyword)) &&
-		strings.EqualFold(p.currentToken.Token.Value, "TRY_CAST") &&
+		(strings.EqualFold(p.currentToken.Token.Value, "TRY_CAST") ||
+			(p.dialect == string(keywords.DialectBigQuery) && strings.EqualFold(p.currentToken.Token.Value, "SAFE_CAST"))) &&
 		p.peekToken().Token.Type == models.TokenTypeLParen {
 		return p.parseTryCastExpression()
 	}
@@ -157,6 +158,7 @@ func (p *Parser) parsePrimaryExpression() (ast.Expression, error) {
 		// Non-reserved keywords (TARGET, SOURCE, etc.) can also be used as identifiers
 		identPos := p.currentLocation()
 		identName := p.currentToken.Token.Value
+		quoted := p.currentToken.Token.Quote != 0
 		p.advance()
 
 		// Check for function call (identifier followed by parentheses)
@@ -179,17 +181,27 @@ func (p *Parser) parsePrimaryExpression() (ast.Expression, error) {
 			return funcCall, nil
 		}
 
+		if !quoted && !p.isType(models.TokenTypePeriod) {
+			switch strings.ToUpper(identName) {
+			case "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME", "LOCALTIME", "LOCALTIMESTAMP":
+				return &ast.FunctionCall{Name: identName, Pos: identPos}, nil
+			}
+		}
 		// Handle regular identifier or qualified identifier (table.column or table.*)
 		ident := &ast.Identifier{Name: identName, Pos: identPos}
 
 		// Check for qualified identifier (table.column) or qualified asterisk (table.*)
-		if p.isType(models.TokenTypePeriod) {
+		for p.isType(models.TokenTypePeriod) && ident.Name != "*" {
 			p.advance() // Consume .
+			qualifier := ident.Name
+			if ident.Table != "" {
+				qualifier = ident.Table + "." + ident.Name
+			}
 			if p.isType(models.TokenTypeAsterisk) || p.isType(models.TokenTypeMul) {
 				// Handle table.* (qualified asterisk).
 				// Both TokenTypeAsterisk and TokenTypeMul represent '*'.
 				ident = &ast.Identifier{
-					Table: ident.Name,
+					Table: qualifier,
 					Name:  "*",
 					Pos:   identPos,
 				}
@@ -199,7 +211,7 @@ func (p *Parser) parsePrimaryExpression() (ast.Expression, error) {
 				// isNonReservedKeyword covers reserved words valid as column
 				// names after a dot, e.g. table.KEY, schema.INDEX, alias.VIEW.
 				ident = &ast.Identifier{
-					Table: ident.Name,
+					Table: qualifier,
 					Name:  p.currentToken.Token.Value,
 					Pos:   identPos,
 				}

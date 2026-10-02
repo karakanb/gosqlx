@@ -84,10 +84,7 @@ func (p *Parser) parseWithStatement() (ast.Statement, error) {
 		stmt.With = withClause
 		return stmt, nil
 	case *ast.SetOperation:
-		// For set operations, attach WITH to the left statement if it's a SELECT
-		if leftSelect, ok := stmt.Left.(*ast.SelectStatement); ok {
-			leftSelect.With = withClause
-		}
+		stmt.With = withClause
 		return stmt, nil
 	case *ast.InsertStatement:
 		stmt.With = withClause
@@ -156,6 +153,7 @@ func (p *Parser) parseCommonTableExpr() (*ast.CommonTableExpr, error) {
 	}
 	cteNamePos := p.currentLocation()
 	name := p.currentToken.Token.Value
+	nameQuoted := p.currentToken.Token.Quote != 0
 	p.advance()
 
 	// Parse optional column list
@@ -240,6 +238,7 @@ func (p *Parser) parseCommonTableExpr() (*ast.CommonTableExpr, error) {
 
 	return &ast.CommonTableExpr{
 		Name:         name,
+		NameQuoted:   nameQuoted,
 		Columns:      columns,
 		Statement:    stmt,
 		Materialized: materialized,
@@ -251,6 +250,9 @@ func (p *Parser) parseCommonTableExpr() (*ast.CommonTableExpr, error) {
 // It supports SELECT, INSERT, UPDATE, and DELETE statements, routing them to the appropriate
 // parsers while preserving set operation support for SELECT statements.
 func (p *Parser) parseMainStatementAfterWith() (ast.Statement, error) {
+	if p.isType(models.TokenTypeLParen) {
+		return p.parseStatement()
+	}
 	if p.isType(models.TokenTypeSelect) {
 		p.advance() // Consume SELECT
 		return p.parseSelectWithSetOperations()

@@ -203,12 +203,15 @@ func (p *Parser) parseCreateTable(temporary bool) (*ast.CreateTableStatement, er
 	if p.isType(models.TokenTypeAs) {
 		p.advance() // AS
 		if p.isType(models.TokenTypeSelect) || p.isType(models.TokenTypeWith) {
-			p.advance() // SELECT / WITH
-			query, err := p.parseSelectWithSetOperations()
+			query, err := p.parseStatement()
 			if err != nil {
 				return nil, err
 			}
-			_ = query // CTAS query not modeled on CreateTableStatement yet
+			var ok bool
+			stmt.Query, ok = query.(ast.QueryExpression)
+			if !ok {
+				return nil, p.expectedError("query after AS")
+			}
 			return stmt, nil
 		}
 		// ClickHouse: CREATE TABLE t AS <source_table> ENGINE = ...
